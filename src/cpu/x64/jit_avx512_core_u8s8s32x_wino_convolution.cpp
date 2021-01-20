@@ -29,6 +29,9 @@
 #include "cpu/x64/jit_primitive_conf.hpp"
 
 #include <string.h>
+#include <chrono>
+#include <algorithm>
+#include <iostream>
 
 namespace dnnl {
 namespace impl {
@@ -983,6 +986,23 @@ status_t jit_avx512_core_u8s8s32x_wino_conv_fwd_ker_t::init_conf(
     jcp.size_wino_wei = tilesize * jcp.oc * jcp.ic;
     jcp.size_wino_dst = alltiles * jcp.oc;
 
+
+    printf("#####WINO CONF START####$\n");
+    printf("nthr: %d\n", jcp.nthr);
+    printf("small_mb: %d\n", jcp.small_mb);
+    printf("xb (tile in output): %d\n", jcp.xb);
+    printf("yb (tile in output): %d\n", jcp.yb);
+    printf("ic_block (elems per inst): %d\n", jcp.ic_block);
+    printf("oc_block (elems per inst): %d\n", jcp.oc_block);
+    printf("m_block (register blocking): %d\n", jcp.m_block);
+    printf("n2_block (register blocking): %d\n", jcp.n2_block);
+
+    printf("nb_mb (tasks): %d\n", jcp.nb_mb);
+    printf("mb_block (batch): %d\n", jcp.mb_block);
+    printf("M, N, K: %d %d %d\n", jcp.M, jcp.N, jcp.K);
+    printf("#####WINO CONF END####$\n");
+ 
+
     return status::success;
 }
 ////////////////////////////////////////////////////////////////////////////////
@@ -1087,6 +1107,13 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
     auto wino_src_base = scratchpad.template get<src_data_t>(key_wino_V);
     auto wino_dst_base = scratchpad.template get<acc_data_t>(key_wino_M);
 
+    double input_trans_time = 0;
+    double gemm_time = 0;
+    double output_trans_time = 0;
+    double total_time = 0;
+
+    auto fwd_start = std::chrono::system_clock::now();
+
     parallel_nd_ext(jcp.nthr, jcp.mb, div_up(jcp.oh, jcp.yb),
             div_up(jcp.ow, jcp.xb),
             [&](int ithr, int nthr, int mb, int tile_y_b, int tile_x_b) {
@@ -1108,6 +1135,8 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
                 auto gemm_p = jit_avx512_core_u8s8s32x_wino_conv_fwd_ker_t::
                         call_params_t();
 
+#pragma omp barrier
+        auto input_trans_start = std::chrono::system_clock::now(); 
                 /* transformation of input tensor to winograd domain */
                 for (int y_in_block = 0; y_in_block < jcp.yb; y_in_block += 2) {
                     for (int x_in_block = 0; x_in_block < jcp.xb;
@@ -1147,6 +1176,14 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
                         (*src_trans_)(&src_trans_p);
                     }
                 }
+#pragma omp barrier
+        auto input_trans_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> in_duration_time = input_trans_end - input_trans_start;
+        input_trans_time += in_duration_time.count();
+
+#pragma omp barrier
+        auto gemm_start = std::chrono::system_clock::now();
+ 
                 /* gemms */
                 for (int tile_ij = 0; tile_ij < 16; tile_ij++) {
                     // start threads at different GEMMs to help bring weights into LLC
@@ -1158,7 +1195,13 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
 
                     (*kernel_)(&gemm_p);
                 }
+#pragma omp barrier
+        auto gemm_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> duration_time = gemm_end - gemm_start;
+        gemm_time += duration_time.count();
 
+#pragma omp barrier
+        auto output_trans_start = std::chrono::system_clock::now();  
                 /* transformation from winograd domain to output tensor */
                 for (int y_in_block = 0; y_in_block < jcp.yb; y_in_block += 2) {
                     for (int x_in_block = 0; x_in_block < jcp.xb;
@@ -1194,7 +1237,20 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
                         (*dst_trans_)(&dst_trans_p);
                     }
                 }
+#pragma omp barrier
+        auto output_trans_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> out_duration_time = output_trans_end - output_trans_start;
+        output_trans_time += out_duration_time.count();
             });
+
+    auto fwd_end = std::chrono::system_clock::now();
+    std::chrono::duration<double, std::milli> fwd_duration_time = fwd_end - fwd_start;
+    total_time += fwd_duration_time.count();
+
+    std::cout << "IN_TRANS TIME: " << input_trans_time << std::endl;
+    std::cout << "GEMM TIME: " << gemm_time << std::endl;
+    std::cout << "OUT_TRANS TIME: " << output_trans_time << std::endl;
+    std::cout << "TOTAL TIME BY TIMER: " << total_time << std::endl;
 }
 
 template <data_type_t dst_data_type>
@@ -1209,9 +1265,19 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
     auto wino_src = scratchpad.template get<src_data_t>(key_wino_V);
     auto wino_dst = scratchpad.template get<acc_data_t>(key_wino_M);
 
+    double input_trans_time = 0;
+    double gemm_time = 0;
+    double output_trans_time = 0;
+    double total_time = 0;
+
+    auto fwd_start = std::chrono::system_clock::now();
+
     for_(int mbb = 0; mbb < jcp.nb_mb; mbb++)
     for_(int tile_y = 0; tile_y < jcp.oh; tile_y += jcp.yb)
     for (int tile_x = 0; tile_x < jcp.ow; tile_x += jcp.xb) {
+
+#pragma omp barrier
+        auto input_trans_start = std::chrono::system_clock::now();
         /* transformation of input tensor to winograd domain */
         parallel_nd(div_up(jcp.yb, 2), div_up(jcp.xb, 2), jcp.mb_block,
                 [&](int y_in_block_b, int x_in_block_b, int mb) {
@@ -1258,7 +1324,13 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
 
                     (*src_trans_)(&src_trans_p);
                 });
+#pragma omp barrier
+        auto input_trans_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> in_duration_time = input_trans_end - input_trans_start;
+        input_trans_time += in_duration_time.count();
 
+#pragma omp barrier
+        auto gemm_start = std::chrono::system_clock::now();
         /* gemms */
         parallel_nd(16, jcp.n_chunks, [&](int tile_ij, int nnb) {
             auto gemm_p = jit_avx512_core_u8s8s32x_wino_conv_fwd_ker_t::
@@ -1274,7 +1346,13 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
 
             (*kernel_)(&gemm_p);
         });
+#pragma omp barrier
+        auto gemm_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> duration_time = gemm_end - gemm_start;
+        gemm_time += duration_time.count();
 
+#pragma omp barrier
+        auto output_trans_start = std::chrono::system_clock::now(); 
         /* transformation from winograd domain to output tensor */
         parallel_nd(div_up(jcp.yb, 2), div_up(jcp.xb, 2), jcp.mb_block,
                 [&](int y_in_block_b, int x_in_block_b, int mb) {
@@ -1315,7 +1393,21 @@ void jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<
 
                     (*dst_trans_)(&dst_trans_p);
                 });
+#pragma omp barrier
+        auto output_trans_end = std::chrono::system_clock::now();
+        std::chrono::duration<double, std::milli> out_duration_time = output_trans_end - output_trans_start;
+        output_trans_time += out_duration_time.count();
     }
+    
+    auto fwd_end = std::chrono::system_clock::now();
+    std::chrono::duration<double, std::milli> fwd_duration_time = fwd_end - fwd_start;
+    total_time += fwd_duration_time.count();
+
+    std::cout << "IN_TRANS TIME: " << input_trans_time << std::endl;
+    std::cout << "GEMM TIME: " << gemm_time << std::endl;
+    std::cout << "OUT_TRANS TIME: " << output_trans_time << std::endl;
+    std::cout << "TOTAL TIME BY TIMER: " << total_time << std::endl;
+
 }
 
 template struct jit_avx512_core_u8s8s32x_wino_convolution_fwd_t<data_type::s8>;
